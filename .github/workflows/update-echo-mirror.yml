@@ -6,6 +6,7 @@ on:
     # 日本時間でも「分」は同じなので、毎時47分ごろに動く。
     - cron: "47 * * * *"
 
+  # Actions画面から手動実行できるようにする
   workflow_dispatch:
 
 permissions:
@@ -45,9 +46,17 @@ jobs:
             exit 1
           fi
 
-          curl -fsSL "$ECHO_POSTS_CSV_URL" -o /tmp/echo_posts.csv
-          curl -fsSL "$ECHO_RATINGS_CSV_URL" -o /tmp/echo_ratings.csv
-          curl -fsSL "$ECHO_DELETED_POSTS_CSV_URL" -o /tmp/echo_deleted_posts.csv
+          clean_url() {
+            printf '%s' "$1" | tr -d '\r\n\t '
+          }
+
+          POSTS_URL="$(clean_url "$ECHO_POSTS_CSV_URL")"
+          RATINGS_URL="$(clean_url "$ECHO_RATINGS_CSV_URL")"
+          DELETED_URL="$(clean_url "$ECHO_DELETED_POSTS_CSV_URL")"
+
+          curl -fsSL "$POSTS_URL" -o /tmp/echo_posts.csv
+          curl -fsSL "$RATINGS_URL" -o /tmp/echo_ratings.csv
+          curl -fsSL "$DELETED_URL" -o /tmp/echo_deleted_posts.csv
 
           python3 - <<'PY'
           import csv
@@ -122,6 +131,7 @@ jobs:
               "wordIds",
               "createdAt",
           }
+
           missing = required_post_cols - set(posts[0].keys())
           if missing:
               raise SystemExit(f"echo_posts CSV missing columns: {sorted(missing)}")
@@ -140,10 +150,12 @@ jobs:
               rating_totals[post_id] += as_int(row.get("value"), 0)
 
           alive_posts = []
+
           for row in posts:
               post_id = str(row.get("postId", "")).strip()
               if not post_id:
                   continue
+
               if post_id in deleted_ids:
                   continue
 
@@ -197,6 +209,7 @@ jobs:
               ])
 
           area_groups = []
+
           for dungeon_id, difficulty, area_id, route in group_order:
               area_groups.append([
                   dungeon_id,
