@@ -31,52 +31,75 @@ jobs:
 
           mkdir -p echo
 
-          if [ -z "${ECHO_POSTS_CSV_URL:-}" ]; then
-            echo "ECHO_POSTS_CSV_URL secret is empty."
-            exit 1
-          fi
-
-          if [ -z "${ECHO_RATINGS_CSV_URL:-}" ]; then
-            echo "ECHO_RATINGS_CSV_URL secret is empty."
-            exit 1
-          fi
-
-          if [ -z "${ECHO_DELETED_POSTS_CSV_URL:-}" ]; then
-            echo "ECHO_DELETED_POSTS_CSV_URL secret is empty."
-            exit 1
-          fi
-
-          clean_url() {
-            python3 -c 'import sys; print("".join(sys.argv[1].split()))' "$1"
-          }
-
-          POSTS_URL="$(clean_url "$ECHO_POSTS_CSV_URL")"
-          RATINGS_URL="$(clean_url "$ECHO_RATINGS_CSV_URL")"
-          DELETED_URL="$(clean_url "$ECHO_DELETED_POSTS_CSV_URL")"
-
-          curl -fsSL "$POSTS_URL" -o /tmp/echo_posts.csv
-          curl -fsSL "$RATINGS_URL" -o /tmp/echo_ratings.csv
-          curl -fsSL "$DELETED_URL" -o /tmp/echo_deleted_posts.csv
-
           python3 - <<'PY'
           import csv
           import json
+          import os
           import time
+          import urllib.request
           from pathlib import Path
           from collections import defaultdict
+
+          dst = Path("echo/echo_backup_latest.json")
+
+          def clean_secret_url(name):
+              raw = os.environ.get(name, "")
+              if not raw:
+                  raise SystemExit(f"{name} is empty")
+
+              # GitHub Secretへ貼り付けた時の前後空白・改行・引用符などを除去。
+              # URL本体はログに出さない。
+              url = raw.strip()
+              url = url.strip('"').strip("'")
+              url = "".join(url.split())
+
+              if not url.startswith("https://docs.google.com/spreadsheets/"):
+                  raise SystemExit(f"{name} is not a valid Google Sheets CSV URL")
+
+              if "output=csv" not in url and "tqx=out:csv" not in url:
+                  raise SystemExit(f"{name} does not look like a CSV export URL")
+
+              return url
+
+          def fetch_csv(secret_name, output_path):
+              url = clean_secret_url(secret_name)
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "LnaEchoMirrorGitHubActions/1.0"
+                      }
+                  )
+                  with urllib.request.urlopen(req, timeout=30) as res:
+                      body = res.read()
+              except Exception as e:
+                  # URL本体は出さない。Secret漏れ防止。
+                  raise SystemExit(f"Failed to fetch CSV from {secret_name}: {type(e).__name__}")
+
+              if not body:
+                  raise SystemExit(f"CSV from {secret_name} is empty")
+
+              output_path.write_bytes(body)
 
           posts_path = Path("/tmp/echo_posts.csv")
           ratings_path = Path("/tmp/echo_ratings.csv")
           deleted_path = Path("/tmp/echo_deleted_posts.csv")
-          dst = Path("echo/echo_backup_latest.json")
 
-          def read_csv(path):
+          fetch_csv("ECHO_POSTS_CSV_URL", posts_path)
+          fetch_csv("ECHO_RATINGS_CSV_URL", ratings_path)
+          fetch_csv("ECHO_DELETED_POSTS_CSV_URL", deleted_path)
+
+          def read_csv(path, label):
               try:
                   text = path.read_text(encoding="utf-8-sig")
               except Exception as e:
-                  raise SystemExit(f"Failed to read CSV {path}: {e}")
+                  raise SystemExit(f"Failed to read {label}: {type(e).__name__}")
 
               rows = list(csv.DictReader(text.splitlines()))
+              if rows is None:
+                  raise SystemExit(f"{label} is unreadable")
+
               return rows
 
           def as_int(value, default=0):
@@ -113,9 +136,9 @@ jobs:
                   return 1
               return as_int(s, 0)
 
-          posts = read_csv(posts_path)
-          ratings = read_csv(ratings_path)
-          deleted_rows = read_csv(deleted_path)
+          posts = read_csv(posts_path, "echo_posts CSV")
+          ratings = read_csv(ratings_path, "echo_ratings CSV")
+          deleted_rows = read_csv(deleted_path, "echo_deleted_posts CSV")
 
           if not posts:
               raise SystemExit("echo_posts CSV is empty or unreadable")
@@ -147,6 +170,7 @@ jobs:
               post_id = str(row.get("postId", "")).strip()
               if not post_id or post_id in deleted_ids:
                   continue
+
               rating_totals[post_id] += as_int(row.get("value"), 0)
 
           alive_posts = []
@@ -231,7 +255,7 @@ jobs:
               "areaGroups": area_groups,
               "deletedPostIds": sorted(deleted_ids),
               "source": "github-sheets-csv-mirror",
-              "githubMirrorVersion": "Lna_EchoMirrorUpdater_GitHubActions_CSV_v01",
+              "githubMirrorVersion": "Lna_EchoMirrorUpdater_GitHubActions_CSV_v02",
               "githubMirrorGeneratedAt": now_ms,
           }
 
