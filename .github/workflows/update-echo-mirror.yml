@@ -1,0 +1,83 @@
+name: Update Echo Mirror
+
+on:
+  schedule:
+    # UTC基準。毎時47分に実行。
+    # 日本時間でも「分」は同じなので、毎時47分ごろに動く。
+    - cron: "47 * * * *"
+
+  # Actions画面から手動実行できるようにする
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-echo-mirror:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch latest echo JSON from GAS
+        shell: bash
+        env:
+          ECHO_SOURCE_URL: ${{ secrets.ECHO_SOURCE_URL }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p echo
+
+          if [ -z "${ECHO_SOURCE_URL:-}" ]; then
+            echo "ECHO_SOURCE_URL secret is empty."
+            exit 1
+          fi
+
+          curl -fsSL "$ECHO_SOURCE_URL" -o /tmp/echo_backup_latest.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          src = Path("/tmp/echo_backup_latest.json")
+          dst = Path("echo/echo_backup_latest.json")
+
+          try:
+              data = json.loads(src.read_text(encoding="utf-8"))
+          except Exception as e:
+              raise SystemExit(f"Invalid JSON from source: {e}")
+
+          if data.get("ok") is not True:
+              raise SystemExit("Source JSON rejected: ok is not true")
+
+          if data.get("schema") != 3:
+              raise SystemExit(f"Source JSON rejected: schema is not 3: {data.get('schema')!r}")
+
+          if "areaGroups" not in data:
+              raise SystemExit("Source JSON rejected: areaGroups is missing")
+
+          data["githubMirrorVersion"] = "Lna_EchoMirrorUpdater_GitHubActions_v01"
+
+          dst.write_text(
+              json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+              encoding="utf-8"
+          )
+          PY
+
+      - name: Commit and push if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- echo/echo_backup_latest.json; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add echo/echo_backup_latest.json
+          git commit -m "Update echo backup mirror"
+          git push
