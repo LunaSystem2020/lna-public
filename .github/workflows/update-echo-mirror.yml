@@ -20,249 +20,73 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build echo JSON from public Google Sheets CSV
+      - name: Fetch latest echo JSON from GAS
         shell: bash
         env:
-          ECHO_POSTS_CSV_URL: ${{ secrets.ECHO_POSTS_CSV_URL }}
-          ECHO_RATINGS_CSV_URL: ${{ secrets.ECHO_RATINGS_CSV_URL }}
-          ECHO_DELETED_POSTS_CSV_URL: ${{ secrets.ECHO_DELETED_POSTS_CSV_URL }}
+          ECHO_SOURCE_URL: ${{ secrets.ECHO_SOURCE_URL }}
         run: |
           set -euo pipefail
 
           mkdir -p echo
 
+          if [ -z "${ECHO_SOURCE_URL:-}" ]; then
+            echo "ECHO_SOURCE_URL secret is empty."
+            exit 1
+          fi
+
           python3 - <<'PY'
-          import csv
           import json
           import os
-          import time
           import urllib.request
           from pathlib import Path
-          from collections import defaultdict
 
-          dst = Path("echo/echo_backup_latest.json")
+          src_path = Path("/tmp/echo_backup_latest.json")
+          dst_path = Path("echo/echo_backup_latest.json")
 
-          def clean_secret_url(name):
-              raw = os.environ.get(name, "")
-              if not raw:
-                  raise SystemExit(f"{name} is empty")
+          raw_url = os.environ.get("ECHO_SOURCE_URL", "")
+          url = raw_url.strip().strip('"').strip("'")
 
-              # GitHub Secretへ貼り付けた時の前後空白・改行・引用符などを除去。
-              # URL本体はログに出さない。
-              url = raw.strip()
-              url = url.strip('"').strip("'")
-              url = "".join(url.split())
+          if not url:
+              raise SystemExit("ECHO_SOURCE_URL is empty")
 
-              if not url.startswith("https://docs.google.com/spreadsheets/"):
-                  raise SystemExit(f"{name} is not a valid Google Sheets CSV URL")
+          if not url.startswith("https://script.google.com/"):
+              raise SystemExit("ECHO_SOURCE_URL does not look like a GAS URL")
 
-              if "output=csv" not in url and "tqx=out:csv" not in url:
-                  raise SystemExit(f"{name} does not look like a CSV export URL")
-
-              return url
-
-          def fetch_csv(secret_name, output_path):
-              url = clean_secret_url(secret_name)
-
-              try:
-                  req = urllib.request.Request(
-                      url,
-                      headers={
-                          "User-Agent": "LnaEchoMirrorGitHubActions/1.0"
-                      }
-                  )
-                  with urllib.request.urlopen(req, timeout=30) as res:
-                      body = res.read()
-              except Exception as e:
-                  # URL本体は出さない。Secret漏れ防止。
-                  raise SystemExit(f"Failed to fetch CSV from {secret_name}: {type(e).__name__}")
-
-              if not body:
-                  raise SystemExit(f"CSV from {secret_name} is empty")
-
-              output_path.write_bytes(body)
-
-          posts_path = Path("/tmp/echo_posts.csv")
-          ratings_path = Path("/tmp/echo_ratings.csv")
-          deleted_path = Path("/tmp/echo_deleted_posts.csv")
-
-          fetch_csv("ECHO_POSTS_CSV_URL", posts_path)
-          fetch_csv("ECHO_RATINGS_CSV_URL", ratings_path)
-          fetch_csv("ECHO_DELETED_POSTS_CSV_URL", deleted_path)
-
-          def read_csv(path, label):
-              try:
-                  text = path.read_text(encoding="utf-8-sig")
-              except Exception as e:
-                  raise SystemExit(f"Failed to read {label}: {type(e).__name__}")
-
-              rows = list(csv.DictReader(text.splitlines()))
-              if rows is None:
-                  raise SystemExit(f"{label} is unreadable")
-
-              return rows
-
-          def as_int(value, default=0):
-              try:
-                  if value is None or str(value).strip() == "":
-                      return default
-                  return int(float(str(value).strip()))
-              except Exception:
-                  return default
-
-          def difficulty_code(value):
-              s = str(value or "").strip().lower()
-              if s in ("", "normal", "0"):
-                  return 0
-              if s in ("hard", "1"):
-                  return 1
-              if s in ("veryhard", "very_hard", "very-hard", "2"):
-                  return 2
-              return 0
-
-          def route_code(value):
-              s = str(value or "").strip().lower()
-              if s in ("", "common", "0"):
-                  return 0
-              if s in ("rare", "1"):
-                  return 1
-              return 0
-
-          def category_code(value):
-              s = str(value or "").strip()
-              if s in ("", "注意", "caution", "notice", "0"):
-                  return 0
-              if s in ("攻略", "guide", "hint", "1"):
-                  return 1
-              return as_int(s, 0)
-
-          posts = read_csv(posts_path, "echo_posts CSV")
-          ratings = read_csv(ratings_path, "echo_ratings CSV")
-          deleted_rows = read_csv(deleted_path, "echo_deleted_posts CSV")
-
-          if not posts:
-              raise SystemExit("echo_posts CSV is empty or unreadable")
-
-          required_post_cols = {
-              "postId",
-              "dungeonId",
-              "difficulty",
-              "areaId",
-              "route",
-              "author",
-              "category",
-              "wordIds",
-              "createdAt",
-          }
-
-          missing = required_post_cols - set(posts[0].keys())
-          if missing:
-              raise SystemExit(f"echo_posts CSV missing columns: {sorted(missing)}")
-
-          deleted_ids = set()
-          for row in deleted_rows:
-              post_id = str(row.get("postId", "")).strip()
-              if post_id:
-                  deleted_ids.add(post_id)
-
-          rating_totals = defaultdict(int)
-          for row in ratings:
-              post_id = str(row.get("postId", "")).strip()
-              if not post_id or post_id in deleted_ids:
-                  continue
-
-              rating_totals[post_id] += as_int(row.get("value"), 0)
-
-          alive_posts = []
-
-          for row in posts:
-              post_id = str(row.get("postId", "")).strip()
-              if not post_id:
-                  continue
-
-              if post_id in deleted_ids:
-                  continue
-
-              created_at = as_int(row.get("createdAt"), 0)
-              dungeon_id = str(row.get("dungeonId", "")).strip()
-              area_id = str(row.get("areaId", "")).strip()
-
-              if not dungeon_id or not area_id:
-                  continue
-
-              alive_posts.append({
-                  "postId": post_id,
-                  "dungeonId": dungeon_id,
-                  "difficulty": difficulty_code(row.get("difficulty")),
-                  "areaId": area_id,
-                  "route": route_code(row.get("route")),
-                  "author": str(row.get("author", "")).strip(),
-                  "category": category_code(row.get("category")),
-                  "wordIds": str(row.get("wordIds", "")).strip(),
-                  "likes": rating_totals.get(post_id, as_int(row.get("likes"), 0)),
-                  "createdAt": created_at,
-                  "own": 0,
-              })
-
-          # 新しい投稿を上に寄せる
-          alive_posts.sort(key=lambda r: r["createdAt"], reverse=True)
-
-          groups = {}
-          group_order = []
-
-          for row in alive_posts:
-              key = (
-                  row["dungeonId"],
-                  row["difficulty"],
-                  row["areaId"],
-                  row["route"],
+          try:
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "LnaEchoMirrorGitHubActions/1.0"
+                  }
               )
+              with urllib.request.urlopen(req, timeout=30) as res:
+                  body = res.read()
+          except Exception as e:
+              # URL本体は出さない。Secret漏れ防止。
+              raise SystemExit(f"Failed to fetch JSON from ECHO_SOURCE_URL: {type(e).__name__}")
 
-              if key not in groups:
-                  groups[key] = []
-                  group_order.append(key)
+          if not body:
+              raise SystemExit("Fetched JSON is empty")
 
-              groups[key].append([
-                  row["postId"],
-                  row["author"],
-                  row["category"],
-                  row["wordIds"],
-                  row["likes"],
-                  row["createdAt"],
-                  row["own"],
-              ])
+          src_path.write_bytes(body)
 
-          area_groups = []
+          try:
+              data = json.loads(src_path.read_text(encoding="utf-8"))
+          except Exception as e:
+              raise SystemExit(f"Invalid JSON from source: {type(e).__name__}")
 
-          for dungeon_id, difficulty, area_id, route in group_order:
-              area_groups.append([
-                  dungeon_id,
-                  difficulty,
-                  area_id,
-                  route,
-                  groups[(dungeon_id, difficulty, area_id, route)],
-              ])
+          if data.get("ok") is not True:
+              raise SystemExit("Source JSON rejected: ok is not true")
 
-          now_ms = int(time.time() * 1000)
+          if data.get("schema") != 3:
+              raise SystemExit(f"Source JSON rejected: schema is not 3: {data.get('schema')!r}")
 
-          data = {
-              "ok": True,
-              "serverTime": now_ms,
-              "count": len(alive_posts),
-              "schema": 3,
-              "groupKeys": ["dungeonId", "difficulty", "areaId", "route", "entries"],
-              "entryKeys": ["postId", "author", "category", "wordIds", "likes", "createdAt", "own"],
-              "areaGroups": area_groups,
-              "deletedPostIds": sorted(deleted_ids),
-              "source": "github-sheets-csv-mirror",
-              "githubMirrorVersion": "Lna_EchoMirrorUpdater_GitHubActions_CSV_v02",
-              "githubMirrorGeneratedAt": now_ms,
-          }
+          if "areaGroups" not in data:
+              raise SystemExit("Source JSON rejected: areaGroups is missing")
 
-          if not data["areaGroups"]:
-              raise SystemExit("Generated JSON has no areaGroups; refuse to overwrite previous mirror")
+          data["githubMirrorVersion"] = "Lna_EchoMirrorUpdater_GitHubActions_GAS_v01"
 
-          dst.write_text(
+          dst_path.write_text(
               json.dumps(data, ensure_ascii=False, separators=(",", ":")),
               encoding="utf-8"
           )
@@ -282,5 +106,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add echo/echo_backup_latest.json
-          git commit -m "Update echo backup mirror from Sheets CSV"
+          git commit -m "Update echo backup mirror from GAS"
           git push
